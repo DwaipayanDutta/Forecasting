@@ -1,0 +1,74 @@
+dataClean.R
+library(data.table)
+library(lubridate)
+setwd("D:/Zipped/Zipped/Junk/Data")
+# Reading file
+pathDataRaw <- "PLDataCSV.csv"
+dataRaw <- fread(pathDataRaw,na.strings = c(NA,""))
+
+# Removing empty spaces from column names
+colnames(dataRaw) <- gsub(" ","",colnames(dataRaw))
+
+# Cleaning data and changing data type of required columns
+dataClean <- copy(dataRaw)
+setnames(dataClean,
+         c("79956TomlinscoteSchoolandSixthFormColleg",
+           "79956TomlinscoteSchoolandSixthFormCollegDays",
+           "86064NowerHillHighSchool",
+           "86064NowerHillHighSchoolDays",
+           "70839WellingSchool",
+           "70839WellingSchoolDays"
+           ),
+         c("Tomlin",
+           "TomlinDays",
+           "Nower",
+           "NowerDays",
+           "Welling",
+           "WellingDays")
+         )
+
+head(dataClean)
+##         Date   Tomlin TomlinDays Nower NowerDays  Welling WellingDays
+## 1: 10/1/2013 39136.25         17    NA        17 38691.79          17
+## 2: 11/1/2013 23731.28         18    NA        17 29842.45          18
+## 3: 12/1/2013 39959.20         17    NA        16 59742.45          17
+## 4:  1/1/2014 24571.82         16    NA        17 26340.97          16
+## 5:  2/1/2014 30881.62         15    NA        15 19111.24          15
+## 6:  3/1/2014 41398.56         25    NA        24 45217.59          25
+# Replacing NA by zero 
+# Function
+zeroReplaceNA <- function(x){
+  for(j in names(x)){
+    set(x,which(is.na(x[[j]])),j,0)
+  }
+}
+
+zeroReplaceNA(dataClean)
+
+dataClean <- dataClean[,c("Date"):=list(as.Date(Date,format = "%d/%m/%Y"))
+                       ][,c("YearMon"):=list(paste0(year(Date),"-",month(Date)))
+                         ][,c("adjTom",
+                              "adjNower",
+                              "adjWelling"):=list(ifelse(TomlinDays!=0,round(Tomlin/TomlinDays,0),0),
+                                                  ifelse(NowerDays!=0,round(Nower/NowerDays,0),0),
+                                                  ifelse(WellingDays!=0,round(Welling/WellingDays,0),0))]
+
+
+# Summary statistics in tabular format
+colNames <- data.table(colnames(dataClean))
+colNA <- data.table(sapply(dataClean,function(x)sum(is.na(x))))
+colUniqueLen <-  data.table(sapply(dataClean,function(x)length(unique(x))))
+colUniqueVals <- data.table(sapply(dataClean,function(x){ifelse(any(length(unique(x))<=20),paste0(unique(x),collapse = ","),"0")}))
+colType <- sapply(dataClean,function(x)typeof(x))
+colMin <- apply(dataClean,2,min,na.rm = TRUE)
+colMax <- apply(dataClean,2,max,na.rm = TRUE)
+
+colInfo <- data.table(Name = colNames,
+                      Type = colType,
+                      NAs = colNA,
+                      UniqueLen = colUniqueLen, 
+                      UniqueVals = colUniqueVals,
+                      Min = colMin,
+                      Max = colMax)
+
+rm(colNames,colNA,colUniqueLen,colUniqueVals,colMin,colMax)
