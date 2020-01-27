@@ -1,0 +1,180 @@
+library(fpp2)
+library(zoo) # For function yearmon
+library(urca) # For kpss test
+library(tseries) # For ADF test
+library(dplyr) # For case when
+
+start.time <- Sys.time()
+
+startDate <- c(2013,10)
+endDate <- c(2018,9)
+
+
+# Extracting days per month for forecasted horizon
+schoolMonthDays <- dataClean[Date>as.Date("2018-9-01"),.(TomlinDays,NowerDays,WellingDays)]
+
+# Converting to ts object
+dataCleanTs <- ts(dataClean[,c(9,10,11)],
+                     frequency=12,
+                     start=startDate)
+
+
+
+# Plotting time series
+autoplot(dataCleanTs[,2])
+
+fcast <- funcfcastSmooth(window(dataCleanTs[,1],end=endDate),6)
+fcast <- funcfcastSmoothAllOutput(window(dataCleanTs[,1],end=startDate),6)
+
+plot(dataCleanTs[,3])
+
+# Forecasting
+fcastTable <- data.table(yearMon = character(),
+                         schoolName=character(),
+                         mean=numeric(),
+                         lower80=numeric(),
+                         upper80=numeric(),
+                         method=numeric(),
+                         rmse=character())
+
+fcastAccTable <- data.table(
+                            schoolName=character(),
+                            Model=character(),
+                            ME=numeric(),
+                            RMSE=numeric(),
+                            MAE=numeric())
+
+fcastAll <- data.table()
+
+
+# i <- 3
+for(i in 1:ncol(dataCleanTs)){
+  if(i==2){
+    timeSeries <- window(dataCleanTs[,i],start=c(2014,5),end=endDate)
+  }else{
+    timeSeries <- window(dataCleanTs[,i],end=endDate)
+  }
+  
+  fcast <- funcfcastSmoothAllOutput(timeSeries,6,schoolMonthDays[,i,with=FALSE][[1]])
+  fcastTable <- rbind(fcastTable,data.table(yearMon = as.character(zoo::as.yearmon(time(dataCleanTs[,1]))),
+                                            schoolName=colnames(dataCleanTs)[i],
+                                            mean=c(window(dataCleanTs[,i],end=endDate),as.numeric(fcast$mean)),
+                                            lower80=c(rep(NA,length(window(dataCleanTs[,i],end=endDate))),as.numeric(fcast$lower80)),
+                                            upper80=c(rep(NA,length(window(dataCleanTs[,i],end=endDate))),as.numeric(fcast$upper80)),
+                                            method=fcast$method,
+                                            rmse=fcast$rmse))
+  
+  fcastAccTable <- rbind(fcastAccTable,data.table(schoolName=colnames(dataCleanTs)[i],
+                                                  Model=fcast$accuracyTable$Model,
+                                                  ME=fcast$accuracyTable$ME,
+                                                  RMSE=fcast$accuracyTable$RMSE,
+                                                  MAE=fcast$accuracyTable$MAE))
+  
+  fcastAll <- rbind(fcastAll,cbind(schoolName=colnames(dataCleanTs)[i],
+                                   bestModel = fcast$method,
+                                   bestModelRMSE = fcast$rmse,
+                                   fcast$allForecasts))
+  
+  }
+
+
+write.csv(fcastAll,file="fcastAll.csv")
+write.csv(fcastAccTable,file="fcastAccTable.csv")
+
+# #### Cross validation ####
+# # Forecasting
+# fcastTableCV <- data.table(yearMon = character(),
+#                          schoolName=character(),
+#                          mean=numeric(),
+#                          lower80=numeric(),
+#                          upper80=numeric(),
+#                          method=numeric(),
+#                          rmse=character())
+# 
+# fcastAccTableCV <- data.table(
+#   schoolName=character(),
+#   Model=character(),
+#   RMSE=numeric())
+# 
+# for(i in 1:ncol(dataCleanTs)){
+#   if(i==2){
+#     timeSeries <- window(dataCleanTs[,i],start=c(2014,1),end=c(2018,12))
+#   }else{
+#     timeSeries <- window(dataCleanTs[,i],end=c(2018,12))
+#   }
+#   
+#   fcast <- funcfcastSmoothCV(timeSeries,12)
+#   fcastTableCV <- rbind(fcastTableCV,data.table(yearMon = as.character(zoo::as.yearmon(time(dataCleanTs[,1]))),
+#                                             schoolName=colnames(dataCleanTs)[i],
+#                                             mean=c(window(dataCleanTs[,i],end=c(2018,12)),as.numeric(fcast$mean)),
+#                                             lower80=c(rep(0,length(window(dataCleanTs[,i],end=c(2018,12)))),as.numeric(fcast$lower80)),
+#                                             upper80=c(rep(0,length(window(dataCleanTs[,i],end=c(2018,12)))),as.numeric(fcast$upper80)),
+#                                             method=fcast$method,
+#                                             rmse=fcast$rmse))
+#   
+#   fcastAccTableCV <- rbind(fcastAccTableCV,data.table(schoolName=colnames(dataCleanTs)[i],
+#                                                   Model=fcast$accuracyTable$Model,
+#                                                   RMSE=fcast$accuracyTable$RMSE))
+# }
+# 
+# # Combining test validation set and cross-validation accuracy table
+# fcastAccTableCombined <- cbind(fcastAccTable,RMSECV=fcastAccTableCV$RMSE)
+# 
+# end.time <- Sys.time()
+# end.time - start.time
+
+
+
+#### Multiplying average monthly numbers by number of days to get total monthly forecasts ####
+fcastTableAdj <- fcastTable
+
+fcastTableAdj[,c("meanAct",
+              "upper80Act",
+              "lower80Act"
+              ):=list(case_when(schoolName == "adjTom" ~ mean*dataClean$TomlinDays,
+                                schoolName == "adjWelling" ~ mean*dataClean$WellingDays,
+                                schoolName == "adjNower" ~ mean*dataClean$NowerDays),
+                      case_when(schoolName == "adjTom" ~ upper80*dataClean$TomlinDays,
+                                schoolName == "adjWelling" ~ upper80*dataClean$WellingDays,
+                                schoolName == "adjNower" ~ upper80*dataClean$NowerDays),
+                      case_when(schoolName == "adjTom" ~ lower80*dataClean$TomlinDays,
+                                schoolName == "adjWelling" ~ lower80*dataClean$WellingDays,
+                                schoolName == "adjNower" ~ lower80*dataClean$NowerDays))]
+
+# Exporting forecasted data
+write.csv(fcastTableAdj,file="fcastTableAdj.csv")
+
+x <- window(dataCleanTs[,3],start=c(2014,5),end=endDate)
+x <- subset(x, end = round(length(x)*0.8,0))
+x <- window(dataCleanTs[,3],start=,end=endDate)
+h <- 6
+d <- schoolMonthDays[,3][[1]]
+fcast <- funcfcastSmoothAllOutput(x,h,d)
+
+##### Creating forecast plots ####
+
+# schoolNameVal <- "adjNower"
+# 
+# #adjTom, adjWelling,adjNower
+# 
+# meanFcast <- window(ts(ifelse(fcastTable[schoolName==schoolNameVal]$mean > 0, as.numeric(fcastTable[schoolName==schoolNameVal]$mean), 0), frequency=12, start=c(2014, 1)),end=c(2019,12))
+# upper80Fcast <- window(ts(ifelse(fcastTable[schoolName==schoolNameVal]$upper80 > 0, as.numeric(fcastTable[schoolName==schoolNameVal]$upper80), 0), frequency=12, start=c(2014, 1)),end=c(2019,12))
+# lower80Fcast <- window(ts(ifelse(fcastTable[schoolName==schoolNameVal]$lower80 > 0, as.numeric(fcastTable[schoolName==schoolNameVal]$lower80), 0), frequency=12, start=c(2014, 1)),end=c(2019,12))
+# methodFcast <- unique(fcastTable[schoolName==schoolNameVal]$method)
+# 
+# time <- attr(meanFcast, "tsp")
+# time <- seq(time[1], attr(meanFcast, "tsp")[2], by=1/time[3])
+# 
+# df <- data.frame(time=time,
+#                  x=c(meanFcast),
+#                  forecast=c(rep(NA, length(window(meanFcast,end=c(2018,9)))), window(meanFcast,start=c(2018,10))),
+#                  low1=c(lower80Fcast),
+#                  upp1=c(upper80Fcast)
+# )
+# 
+# 
+# spline_intF <- as.data.frame(spline(df[!is.na(df$forecast), ]$time, 
+#                                    df[!is.na(df$forecast), ]$forecast))
+# spline_intA <- as.data.frame(spline(df[!is.na(df$forecast), ]$time, 
+#                                    df[!is.na(df$forecast), ]$forecast))
+# 
