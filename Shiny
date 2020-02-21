@@ -1,1 +1,1115 @@
 
+library(shiny)
+library(shinythemes)
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(fpp2)
+library(xts)
+library(tsintermittent)
+library(ggplot2)
+library(RInno)
+
+
+ui <- fluidPage(theme = shinytheme("journal"),
+  sidebarLayout(
+    sidebarPanel(   
+      fluidRow(
+      column(12, fileInput('datafileOrderHist', 'Choose Order-History CSV file',
+                                              accept=c('text/csv', 'text/comma-separated-values,text/plain')))
+      )
+      ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("DescriptiveStatistics",
+                 column(12,br()),
+                 column(12,tableOutput('summaryStat'))
+        ),
+        tabPanel("L1Forecast",
+                 column(12,br()),
+                 column(12,
+                        column(6, uiOutput("selectSKU"))
+                        ),
+                 plotOutput("plotL1")
+                 
+        ),
+        tabPanel("L1Info",
+                 column(12,br()),
+                 column(12,
+                        column(6,tableOutput('demandType')),
+                        column(6,tableOutput('methodsUsed'))
+                 )
+                 
+        ),
+        tabPanel("L2Forecast",
+                 column(12,br()),
+                 column(12,
+                        column(6, uiOutput("selectComplexity"))
+                 ),
+                 plotOutput("plotL2")
+                 
+        )
+      )
+    )
+  )
+  
+  # fluidRow(
+  #   column(12,
+  #          tableOutput('table')
+  #   )
+  # )
+)
+
+server <- function(input, output) {  
+  
+  #### Reading Order-History input file ####
+  filedataOrderHistR <- reactive({
+    infile <- input$datafileOrderHist
+    # Validation
+    if (is.null(infile)) {
+      # User has not uploaded a file yet
+      return(NULL)
+    }
+    fread(infile$datapath, na.strings = c("","NA"))
+  })
+  
+  #### Data cleaning ####
+  cleanDataR <- reactive({
+    filedataOrderHist <- filedataOrderHistR()
+    cleanData <- filedataOrderHist[,.(Date = as.Date(Date, "%m/%d/%Y"),
+                            SKU = SKU,
+                            Qty = Qty,
+                            Complexity = Complexity)]
+  })
+  
+  #### Summary statistics ####
+  summaryStatisticsR <- reactive({
+    # Validation
+    validate(
+      need((input$datafileOrderHist != ""), "Please select a data set")
+    )
+    cleanData <- cleanDataR()
+    
+    # Displaying summary statistics
+    NAs <- apply(cleanData,2,function(x)sum(is.na(x)))
+    Type <- sapply(cleanData,function(x)typeof(x))
+    Min <- apply(cleanData,2,min,na.rm = TRUE)
+    Max <- apply(cleanData,2,max,na.rm = TRUE)
+    Unique <- apply(cleanData,2,function(x)length(unique(na.omit(x))))
+    
+    summaryTab <- data.table(columnNames = colnames(cleanData), cbind(t(rbind(Type, NAs,Min,Max,Unique))))
+    
+    summaryTab[, c("Min",
+                   "Max",
+                   "Unique") := list(if_else(Type == "character",as.character(NA),Min), 
+                                     if_else(Type == "character",as.character(NA),Max),
+                                     if_else(Type != "character",as.character(NA),Unique) 
+                   )]
+    
+    # Removing unused variables
+    rm(NAs,
+       Type,
+       Min,
+       Max,
+       Unique)
+
+    summaryTab
+    
+  })
+  
+  #### Cleaned data for L1 ####
+  cleanDataL1R <- reactive({
+    cleanData <- cleanDataR()
+    cleanDataL1 <- cleanData[,.(Date, SKU, Qty)]
+    })
+  
+  #### SKU Info start-end dates ####
+  SKUInfoStartEndR <- reactive({
+    # Validation
+    validate(
+      need((input$datafileOrderHist != ""), "Please select a data set")
+    )
+    
+    cleanDataL1 <- cleanDataL1R()
+    
+    SKUInfo <- cleanDataL1[,.(startDate = min(Date), 
+                              startWeek = lubridate::week(min(Date)), 
+                              startMonth = month(min(Date)),
+                              startYear = year(min(Date)),
+                              endDate = max(Date), 
+                              endWeek = lubridate::week(max(Date)), 
+                              endMonth = month(max(Date)),
+                              endYear = year(max(Date)) ), by = c("SKU")]
+    
+  })
+  
+  #### Creating daily data object ####
+  cleanDataL1AllDaysR <- reactive({
+    cleanDataL1 <- cleanDataL1R()
+    
+    # Creating dataset having all combination of sKU and dates
+    allDaysL1 <- CJ(SKU = cleanDataL1[,unique(SKU)],Date = seq.Date(min(cleanDataL1$Date),max(cleanDataL1$Date), by = "day"))
+    
+    # Joining above data set with cleanDataL1 to get quantities for each SKU
+    cleanDataL1AllDays <- cleanDataL1[allDaysL1, on = .(SKU,Date)][is.na(Qty), Qty := 0]
+    
+  })
+  
+  
+  #### Creating monthly ts object ####
+  dataMonthlyL1_tsR <- reactive({
+    
+    # Validation
+    validate(
+      need((input$datafileOrderHist != ""), "Please select a data set")
+    )
+    
+    cleanDataL1AllDays <- cleanDataL1AllDaysR()
+    
+    cleanDataL1AllDaysT <- data.table(dcast(cleanDataL1AllDays,Date~SKU, value.var = "Qty", fun = sum))
+    
+    cleanDataL1AllDaysT <- cleanDataL1AllDaysT[order(Date)]
+    
+    # Creating xts object from transposed dataset
+    dataDailyL1_xts <- as.xts(cleanDataL1AllDaysT, order.by = cleanDataL1AllDaysT$Date)
+    
+    # Converting daily dataset to monthly dataset
+    dataMonthlyL1_xts <- apply.monthly(dataDailyL1_xts, apply,2,sum)
+    
+    # Conveting monthly xts object to ts for aiding demand classification and forecasting
+    dataMonthlyL1_ts <- ts(dataMonthlyL1_xts, start = c(2016,1), end = c(2018,8), frequency = 12)
+    
+    
+  })
+  
+  #### Demand Classification ####
+  tsClassL1R <- reactive({
+
+    # Validation
+    validate(
+      need((input$datafileOrderHist != ""), "Please select a data set")
+    )
+
+    SKUInfo <- SKUInfoStartEndR()
+    dataMonthlyL1_ts <- dataMonthlyL1_tsR()
+
+    tsClassL1 <- data.table(
+      SKU = character(),
+      tsClassL1Type = character(),
+      adi = numeric(),
+      cv2 = numeric()
+    )
+    
+    n <- ncol(dataMonthlyL1_ts)
+    pb <- txtProgressBar(min = 0, max = n, initial = 0)
+
+    for(i in 1:n) {
+
+      setTxtProgressBar(pb,i)
+      
+      # Finding start and end month for SKU
+      startSKU <- SKUInfo[SKU == colnames(dataMonthlyL1_ts)[i],
+                          .(startMonth, startYear)]
+      
+      iObj <- as.numeric(window(dataMonthlyL1_ts[,i],c(startSKU$startYear,startSKU$startMonth)))
+      iObjColName <- as.character(colnames(dataMonthlyL1_ts)[i])
+      
+      if(sum(iObj) == 0){
+        tsClassL1TypeVal <- "NODEMAND"
+        idClassObj <- data.table(p = "0", cv2 = "0")
+      }
+      else{
+        idClassObj <- idclass(iObj, outplot = 3)
+        adi = idClassObj$p
+        cv2 = idClassObj$cv2
+        
+        tsClassL1TypeVal = case_when(
+          adi < 1.32 & cv2 < 0.49 ~ "SMOOTH",
+          adi >= 1.32 & cv2 < 0.49 ~ "INTERMITTENT",
+          adi < 1.32 & cv2 >= 0.49 ~ "ERRATIC",
+          adi >= 1.32 & cv2 >= 0.49 ~ "LUMPY",
+          TRUE ~ "OTHER"
+        )
+      }
+      
+      SKU <- iObjColName
+      tsClassL1Type <- as.character(tsClassL1TypeVal)
+      adi <- if_else(is.na(adi), 0, round(as.numeric(adi),2))
+      cv2 <- if_else(is.na(cv2), 0, round(as.numeric(cv2),2))
+      
+      tsClassL1 <- rbind(tsClassL1, data.table(
+        SKU,
+        tsClassL1Type,
+        adi,
+        cv2
+      ))
+    }
+
+    tsClassL1
+
+  })
+  
+  #### SKU Info with demand type ####
+  SKUInfoDemTypeR <- reactive({
+    
+    # Validation
+    validate(
+      need((input$datafileOrderHist != ""), "Please select a data set")
+    )
+    
+    SKUInfo <- SKUInfoStartEndR()
+    tsClassL1 <- tsClassL1R()
+    
+    # SKUInfo left join tsClass
+    SKUInfo <- (tsClassL1[SKUInfo, on = c(SKU = "SKU")])
+  })
+  
+
+  #### L1 Forecasting ####
+  fcastL1ListR <- reactive({
+    dataMonthlyL1_ts <- dataMonthlyL1_tsR()
+    SKUInfo <- SKUInfoDemTypeR()
+    
+    # Forecasting function
+    funcfcast <- function(x, h, demandType){
+      
+      if (demandType == "INTERMITTENT" | demandType == "LUMPY") {
+        # Creating train and test set from time series
+        train.x <- subset(x, end = round(length(x) * 0.8, 0))
+        test.x <- subset(x, start = round(length(x) * 0.8, 0) + 1)
+        
+        # Calculating forecast horizon for measuring accuracy
+        test.h <- length(test.x)
+        
+        if (length(train.x[train.x > 0]) <= 1) {
+          # print("NotEnough point")
+          fcastMean <-  list(
+            mean = as.numeric(rep(0, h)),
+            lower80 = as.numeric(rep(0, h)),
+            upper80 = as.numeric(rep(0, h)),
+            method = "None",
+            rmse = NA
+          )
+        } else{
+          # ETS
+          fit.ets <- ets(train.x)
+          fcast.ets <- forecast(fit.ets, h = test.h)
+          acc.ets <- round(accuracy(fcast.ets$mean, test.x)[2], 2)
+          
+          
+          # Croston
+          fcast.crost <-
+            crost(train.x,
+                  type = 'croston',
+                  h = test.h,
+                  outplot = FALSE)
+          acc.crost <- round(accuracy(fcast.crost$frc.out, test.x)[2], 2)
+          
+          # Croston SBA
+          fcast.crostSBA <-
+            crost(train.x,
+                  type = 'sba',
+                  h = test.h,
+                  outplot = FALSE)
+          acc.crostSBA <-
+            round(accuracy(fcast.crostSBA$frc.out, test.x)[2], 2)
+          
+          # Croston SBJ
+          fcast.crostSBJ <-
+            crost(train.x,
+                  type = 'sbj',
+                  h = test.h,
+                  outplot = FALSE)
+          acc.crostSBJ <-
+            round(accuracy(fcast.crostSBJ$frc.out, test.x)[2], 2)
+          
+          bestFitModel <-
+            min(acc.ets, acc.crost, acc.crostSBA, acc.crostSBJ)
+          
+          if (bestFitModel == acc.ets) {
+            fit.ets <- ets(x)
+            fcast.ets <- forecast(fit.ets, h = h)
+            
+            fcastMean <- list(
+              mean = round(round(fcast.ets$mean), 1),
+              lower80 = round(fcast.ets$lower[, 1], 1),
+              upper80 = round(fcast.ets$upper[, 1], 1),
+              method = fcast.ets$method,
+              rmse = acc.ets
+              
+            )
+          } else{
+            if (bestFitModel == acc.crost) {
+              fit.crost <- crost(x,
+                                 type = 'croston',
+                                 h = h,
+                                 outplot = FALSE)
+            }
+            if (bestFitModel == acc.crostSBA) {
+              fit.crost <- crost(x,
+                                 type = 'sba',
+                                 h = h,
+                                 outplot = FALSE)
+            }
+            if (bestFitModel == acc.crostSBJ) {
+              fit.crost <- crost(x,
+                                 type = 'sbj',
+                                 h = h,
+                                 outplot = FALSE)
+            }
+            
+            fcastMean <-  list(
+              mean = round(fit.crost$frc.out, 1),
+              lower80 = as.numeric(rep(0, h)),
+              upper80 = as.numeric(rep(0, h)),
+              method = fit.crost$model,
+              rmse = bestFitModel
+            )
+          }
+          
+        }
+      }
+      if(demandType == "OTHER"){
+        # print("Other")
+        # print(x)
+        # print(meanf(x, h = h)$mean)
+        fcastMean <-  list(
+          mean = meanf(x, h = h)$mean,
+          lower80 = as.numeric(rep(0, h)),
+          upper80 = as.numeric(rep(0, h)),
+          method = meanf(x, h = h)$method,
+          rmse = NA
+        )
+      }
+      if(demandType == "SMOOTH" | demandType == "ERRATIC"){
+        # Creating train and test set from time series 
+        train.x <- subset(x, end = round(length(x)*0.8,0))
+        test.x <- subset(x, start = round(length(x)*0.8,0)+1)
+        
+        # Calculating forecast horizon for measuring accuracy
+        test.h <- length(test.x)
+        
+        # Forecasting using average method
+        fcast.mean <- meanf(train.x, h = test.h)
+        # plot(fcast.mean)
+        # print("meanT")
+        
+        # Forecasting using naive method
+        fcast.naive <- naive(train.x, h = test.h)
+        # plot(fcast.naive)
+        # print("naiveT")
+        
+        # Forecasting using snaive method
+        if(length(train.x) >= 13){
+          fcast.snaive <- snaive(train.x, h = test.h)
+        }else{
+          fcast.snaive <- meanf(train.x, h = test.h)
+        }
+        # plot(fcast.snaive)
+        # print("snaiveT")
+        
+        # # Forecasting using drift method
+        # fcast.drift <- rwf(train.x, h = test.h, drift=TRUE)
+        # plot(fcast.drift)
+        # print("driftT")
+        
+        # Forecasting using regression method
+        if (length(train.x) >= 12) {
+          fit.tslm <- tslm(train.x ~ trend + season)
+          fcast.tslm <- forecast(fit.tslm, h = test.h)
+        } else{
+          fcast.tslm <- meanf(train.x, h = test.h)
+        }
+        # plot(fcast.tslm)
+        # print("tslmT")
+        
+        # Forecasting using stl method
+        # print(length(train.x))
+        if(length(train.x) >= 25){
+          fit.stl <- stl(train.x, s.window = "periodic")
+          fcast.stl <- forecast(fit.stl, h = test.h)
+          # plot(fcast.stl)
+        }else{
+          fcast.stl <- meanf(train.x, h = test.h)
+        }
+        # print("stlT")
+        
+        # Forecasting using ets method
+        fit.ets <- ets(train.x)
+        fcast.ets <- forecast(fit.ets, h = test.h)
+        # plot(fcast.ets)
+        # print("etsT")
+        
+        # Forecasting using auto.arima method
+        fit.autoarima <- auto.arima(train.x)
+        fcast.autoarima <- forecast(fit.autoarima, h = test.h)
+        # plot(fcast.autoarima)
+        # print("autoarimaT")
+        
+        set.seed(222)
+        # Forecasting using nnet method
+        if (length(train.x) >= 25) {
+          fit.nn <- nnetar(train.x, lambda = 0.5)
+          fcast.nn <- forecast(fit.nn, h = test.h)
+        } else{
+          fcast.nn <- meanf(train.x, h = test.h)
+        }
+        # plot(fcast.nn)
+        # print("nnT")
+        
+        # Calculating accuracy measures using each method on test data
+        acc.mean <- round(accuracy(fcast.mean$mean, test.x),2)
+        acc.naive <- round(accuracy(fcast.naive$mean, test.x),2)
+        acc.snaive <- round(accuracy(fcast.snaive$mean, test.x),2)
+        # acc.drift <- round(accuracy(fcast.drift$mean, test.x),2)
+        acc.tslm <- round(accuracy(fcast.tslm$mean, test.x),2)
+        acc.stl <- round(accuracy(fcast.stl$mean, test.x),2)
+        acc.ets <- round(accuracy(fcast.ets$mean, test.x),2)
+        acc.autoarima <- round(accuracy(fcast.autoarima$mean, test.x),2)
+        acc.nn <- round(accuracy(fcast.nn$mean, test.x),2)
+        
+        # Creating table having accuracy measures using each method on test data
+        acc.table <-
+          cbind(
+            Model = c(
+              "mean",
+              "naive",
+              "snaive",
+              # "drift",
+              "tslm",
+              "stl",
+              "ets",
+              "autoarima",
+              "nn"
+            ),
+            data.table(
+              rbind(
+                acc.mean[1, ],
+                acc.naive[1, ],
+                acc.snaive[1, ],
+                # acc.drift[1, ],
+                acc.tslm[1, ],
+                acc.stl[1, ],
+                acc.ets[1, ],
+                acc.autoarima[1, ],
+                acc.nn[1, ]
+              )
+            )
+          )
+        
+        # print(acc.table)
+        
+        # Choosing best model based on RMSE measure of accuracy
+        bestFitModel <- min(acc.mean[2],
+                            acc.naive[2],
+                            acc.snaive[2],
+                            # acc.drift[2],
+                            acc.tslm[2],
+                            acc.stl[2],
+                            acc.ets[2],
+                            acc.autoarima[2],
+                            acc.nn[2],na.rm = TRUE)
+        
+        if(bestFitModel == acc.mean[2]){
+          fcast <- meanf(x, h = h)
+          # print("mean")
+        }
+        if(bestFitModel == acc.naive[2]){
+          fcast <- naive(x, h = h)
+          # print("naive")
+        }
+        if(bestFitModel == acc.snaive[2]){
+          if(length(train.x) >= 13){
+            fcast <- snaive(x, h = h)  
+          }else{
+            fcast <- meanf(x, h = h)
+          }
+          # print("snaive")
+        }
+        # if(bestFitModel == acc.drift[2]){
+        #   fcast <- rwf(x, h = h, drift=TRUE)
+        #   # print("drift")
+        # }
+        if(bestFitModel == acc.tslm[2]){
+          if (length(train.x) >= 12) {
+            fit <- tslm(x ~ trend + season)
+            fcast <- forecast(fit, h = h)
+          } else{
+            fcast <- meanf(x, h = h)
+          }
+          # print("regression")
+        }
+        if(bestFitModel == acc.stl[2]){
+          if (length(train.x) >= 25) {
+            fit <- stl(x, s.window = "periodic")
+            fcast <- forecast(fit, h = h)
+          } else{
+            fcast <- meanf(x, h = h)
+          }
+          # print("stl")
+        }
+        if(bestFitModel == acc.ets[2]){
+          fit <- ets(x)
+          fcast <- forecast(fit, h = h)
+          # print("ets")
+        }
+        if(bestFitModel == acc.autoarima[2]){
+          fit <- auto.arima(x)
+          fcast <- forecast(fit, h = h)
+          # print("autoarima")
+        }
+        set.seed(222)
+        if(bestFitModel == acc.nn[2]){
+          if (length(train.x) >= 25) {
+            fit <- nnetar(x, lambda = 0.5)
+            fcast <- forecast(fit, PI=TRUE, h = h)
+          } else{
+            fcast <- meanf(x, h = h)
+          }
+          # print("nn")
+        }
+        fcastMean <- list(
+          mean = round(fcast$mean,1),
+          lower80 = round(fcast$lower[,1],1), 
+          upper80 = round(fcast$upper[,1],1),
+          method = fcast$method,
+          rmse = bestFitModel
+        )
+      }
+      
+      return(fcastMean)
+    }
+    
+    totParts <- ncol(dataMonthlyL1_ts)
+    fcastHorizonL1 <- 12
+    
+    # Creating empty matrix for holding forecasted values
+    fcastL1PMean <- matrix(NA,nrow=fcastHorizonL1,ncol=totParts)
+    fcastL1PLower80 <- matrix(NA,nrow=fcastHorizonL1,ncol=totParts)
+    fcastL1PUpper80 <- matrix(NA,nrow=fcastHorizonL1,ncol=totParts)
+    fcastL1PMethodRMSE <- data.table(SKU = c(colnames(dataMonthlyL1_ts)), Method = NA, RMSE = NA)
+    
+    # Progress bar for loop
+    pb <- txtProgressBar(min = 0, max = totParts, initial = 0)
+    
+    # Producing forecast for every forecastable part 
+    for(i in 1:totParts){
+      setTxtProgressBar(pb,i)
+      
+      SKUVal <- colnames(dataMonthlyL1_ts)[i]
+      
+      # Finding startMonth, startYear and demandType for part from partInfo table
+      currentSKUInfo <- SKUInfo[SKU == SKUVal, .(startMonth, startYear, tsClassL1Type)]
+      
+      startMonth <- currentSKUInfo$startMonth
+      startYear <- currentSKUInfo$startYear
+      demandType <- currentSKUInfo$tsClassL1Type
+      endMonth <- 8
+      endYear <- 2018
+      
+      # Selecting the part of times series depeding on its start year and month
+      SKUTs <- window(dataMonthlyL1_ts[,SKUVal], c(startYear, startMonth), c(endYear, endMonth))
+      
+      # Supressing warning while forecast function runs
+      oldw <- getOption("warn")
+      options(warn = -1)
+      
+      # Storing forecasted values returned from forecasting function in a list
+      fcastL1p  <- funcfcast(SKUTs, fcastHorizonL1, demandType)
+      
+      # Resetting warning settings to 0
+      options(warn = oldw)
+      
+      # Extracting values from returned list
+      # Mean
+      fcastL1PMean[,i] <- round(fcastL1p[[1]],0)
+      fcastL1PMean[,i] <- round(replace(fcastL1PMean[,i], fcastL1PMean[,i] < 0, 0),0)
+      
+      # Lower 80% limit
+      fcastL1PLower80[,i] <- round(fcastL1p[[2]],0)
+      fcastL1PLower80[,i] <- round(replace(fcastL1PLower80[,i], fcastL1PLower80[,i] < 0, 0),0)
+      
+      # Upper 80% limit
+      fcastL1PUpper80[,i] <- round(fcastL1p[[3]],0)  
+      fcastL1PUpper80[,i] <- round(replace(fcastL1PUpper80[,i], fcastL1PUpper80[,i] < 0, 0),0)
+      
+      # Method
+      fcastL1PMethodRMSE$Method[i] <- fcastL1p[[4]]
+      
+      # RMSE
+      fcastL1PMethodRMSE$RMSE[i] <- round(fcastL1p[[5]],2)
+      
+    }
+    
+    # Saving forecasted values in a list
+    fcastL1List <- list(fcastMean = fcastL1PMean, 
+                        fcastLower80 = fcastL1PLower80, 
+                        fcastUpper80 = fcastL1PUpper80, 
+                        fcastMethodRMSE = fcastL1PMethodRMSE)
+    
+  })
+  
+  #### L2 Monthly data ####
+  dataMonthlyL2_tsR <- reactive({
+    cleanData <- cleanDataR()
+    cleanDataL1AllDays <- cleanDataL1AllDaysR()
+    
+    lookupTableL1L2 <- cleanData[,.N, by = c("SKU", "Complexity")][,.(SKU, Complexity)]
+    
+    # Creating dataset having all combination of complexity and dates by joining lookupTableL1L2 with 
+    # cleanDataL1AllDays and aggregating on date and complexity
+    cleanDataL2AllDays <- lookupTableL1L2[cleanDataL1AllDays, on = c("SKU")
+                                          ][,.(Qty = sum(Qty)), by = c("Date","Complexity")]
+    
+    cleanDataL2AllDaysT <- data.table(dcast(cleanDataL2AllDays,Date~Complexity, value.var = "Qty", fun = sum))
+    
+    cleanDataL2AllDaysT <- cleanDataL2AllDaysT[order(Date)]
+    
+    # Creating xts object from transposed dataset
+    dataDailyL2_xts <- as.xts(cleanDataL2AllDaysT, order.by = cleanDataL2AllDaysT$Date)
+    
+    # Converting daily dataset to monthly dataset
+    dataMonthlyL2_xts <- apply.monthly(dataDailyL2_xts, apply,2,sum)
+    
+    # Conveting monthly xts object to ts for aiding demand classification and forecasting
+    dataMonthlyL2_ts <- ts(dataMonthlyL2_xts, start = c(2016,1), end = c(2018,8), frequency = 12)
+  })
+  
+  #### L2 Forecasting ####
+  fcastL2ListR <- reactive({
+    cleanData <- cleanDataR() 
+    dataMonthlyL2_ts <- dataMonthlyL2_tsR()
+    
+    # Forecasting function
+    ####
+    funcfcastSmooth <- function(x, h){
+      
+      # Creating train and test set from time series 
+      train.x <- subset(x, end = round(length(x)*0.8,0))
+      test.x <- subset(x, start = round(length(x)*0.8,0)+1)
+      
+      # Calculating forecast horizon for measuring accuracy
+      test.h <- length(test.x)
+      
+      # Forecasting using average method
+      fcast.mean <- meanf(train.x, h = test.h)
+      # print("fcast.meanT")
+      
+      # Forecasting using naive method
+      fcast.naive <- naive(train.x, h = test.h)
+      # print("fcast.naiveT")
+      
+      # Forecasting using snaive method
+      fcast.snaive <- snaive(train.x, h = test.h)
+      # print("fcast.snaiveT")
+      
+      # # Forecasting using drift method
+      # fcast.drift <- rwf(train.x, h = test.h, drift=TRUE)
+      # # print("fcast.driftT")
+      
+      # Forecasting using regression method
+      fit.tslm <- tslm(train.x ~ trend + season)
+      fcast.tslm <- forecast(fit.tslm, h = test.h)
+      # print("fcast.tslmT")
+      
+      # Forecasting using stl method
+      fit.stl <- stl(train.x, s.window = "periodic")
+      fcast.stl <- forecast(fit.stl, h = test.h)
+      # print("fcast.stlT")
+      
+      # Forecasting using ets method
+      fit.ets <- ets(train.x)
+      fcast.ets <- forecast(fit.ets, h = test.h)
+      # print("fcast.etsT")
+      
+      # Forecasting using auto.arima method
+      fit.autoarima <- auto.arima(train.x)
+      fcast.autoarima <- forecast(fit.autoarima, h = test.h)
+      # print("fcast.autoarimaT")
+      
+      # Forecasting using nnet method
+      set.seed(222)
+      fit.nn <- nnetar(train.x, lambda = 0.5)
+      fcast.nn <- forecast(fit.nn, h = test.h)
+      # print("fcast.nnT")
+      
+      # Calculating accuracy measures using each method on test data
+      acc.mean <- round(accuracy(fcast.mean$mean, test.x),2)
+      acc.naive <- round(accuracy(fcast.naive$mean, test.x),2)
+      acc.snaive <- round(accuracy(fcast.snaive$mean, test.x),2)
+      # acc.drift <- round(accuracy(fcast.drift$mean, test.x),2)
+      acc.tslm <- round(accuracy(fcast.tslm$mean, test.x),2)
+      acc.stl <- round(accuracy(fcast.stl$mean, test.x),2)
+      acc.ets <- round(accuracy(fcast.ets$mean, test.x),2)
+      acc.autoarima <- round(accuracy(fcast.autoarima$mean, test.x),2)
+      acc.nn <- round(accuracy(fcast.nn$mean, test.x),2)
+      
+      # Creating table having accuracy measures using each method on test data
+      acc.table <-
+        cbind(
+          Model = c(
+            "mean",
+            "naive",
+            "snaive",
+            # "drift",
+            "tslm",
+            "stl",
+            "ets",
+            "autoarima",
+            "nn"
+          ),
+          data.table(
+            rbind(
+              acc.mean[1, ],
+              acc.naive[1, ],
+              acc.snaive[1, ],
+              # acc.drift[1, ],
+              acc.tslm[1, ],
+              acc.stl[1, ],
+              acc.ets[1, ],
+              acc.autoarima[1, ],
+              acc.nn[1, ]
+            )
+          )
+        )
+      
+      # Choosing best model based on RMSE measure of accuracy
+      bestFitModel <- min(acc.mean[2],
+                          acc.naive[2],
+                          acc.snaive[2],
+                          # acc.drift[2],
+                          acc.tslm[2],
+                          acc.stl[2],
+                          acc.ets[2],
+                          acc.autoarima[2],
+                          acc.nn[2])
+      
+      if(bestFitModel == acc.mean[2]){
+        fcast <- meanf(x, h = h)
+        # print("mean")
+      }
+      if(bestFitModel == acc.naive[2]){
+        fcast <- naive(x, h = h)
+        # print("naive")
+      }
+      if(bestFitModel == acc.snaive[2]){
+        fcast <- snaive(x, h = h)
+        # print("snaive")
+      }
+      # if(bestFitModel == acc.drift[2]){
+      #   fcast <- rwf(x, h = h, drift=TRUE)
+      #   # print("drift")
+      # }
+      if(bestFitModel == acc.tslm[2]){
+        fit <- tslm(x ~ trend + season)
+        fcast <- forecast(fit, h = h)
+        # print("regression")
+      }
+      if(bestFitModel == acc.stl[2]){
+        fit <- stl(x, s.window = "periodic")
+        fcast <- forecast(fit, h = h)
+        # print("stl")
+      }
+      if(bestFitModel == acc.ets[2]){
+        fit <- ets(x)
+        fcast <- forecast(fit, h = h)
+        # print("ets")
+      }
+      if(bestFitModel == acc.autoarima[2]){
+        fit <- auto.arima(x)
+        fcast <- forecast(fit, h = h)
+        # print("autoarima")
+      }
+      if(bestFitModel == acc.nn[2]){
+        set.seed(222)
+        fit <- nnetar(x, lambda = 0.5)
+        fcast <- forecast(fit, PI=TRUE, h = h)
+        # print("nn")
+      }
+      
+      # print(round(fcast$lower[,1],1))
+      # print(round(fcast$upper[,1],1))
+      # print(fcast$method)
+      fcastMean <- list(
+        mean = round(fcast$mean,1),
+        lower80 = round(fcast$lower[,1],1), 
+        upper80 = round(fcast$upper[,1],1),
+        method = fcast$method,
+        rmse = bestFitModel
+      )
+      
+      # plot(fcast)
+      # print(acc.table)
+      return(fcastMean)
+    }
+    ####
+    
+    totL2 <- ncol(dataMonthlyL2_ts)
+    fcastHorizonL2 <- 12
+    
+    # Creating empty matrix for holding forecasted values
+    fcastL2PMean <- matrix(NA,nrow=fcastHorizonL2,ncol=totL2)
+    fcastL2PLower80 <- matrix(NA,nrow=fcastHorizonL2,ncol=totL2)
+    fcastL2PUpper80 <- matrix(NA,nrow=fcastHorizonL2,ncol=totL2)
+    fcastL2PMethodRMSE <- data.table(SKU = c(colnames(dataMonthlyL2_ts)), Method = NA, RMSE = NA)
+    
+    # Progress bar for loop
+    pb <- txtProgressBar(min = 0, max = totL2, initial = 0)
+    
+    # Producing forecast for every forecastable L2 part 
+    for(i in 1:totL2){
+      setTxtProgressBar(pb,i)
+      
+      L2Val <- colnames(dataMonthlyL2_ts)[i]
+      
+      # Setting start and end time period
+      startMonth <- cleanData[Complexity == L2Val, min(month(Date))]
+      startYear <- cleanData[Complexity == L2Val, min(year(Date))]
+      endMonth <- 8
+      endYear <- 2018
+      
+      # Selecting the part of times series depeding on its start year and month
+      L2s <- window(dataMonthlyL2_ts[,L2Val], c(startYear, startMonth), c(endYear, endMonth))
+      
+      # Supressing warning while forecast function runs
+      oldw <- getOption("warn")
+      options(warn = -1)
+
+      # Storing forecasted values returned from forecasting function in a list
+      fcastL2p  <- funcfcastSmooth(L2s, fcastHorizonL2)
+      
+      # Resetting warning settings to 0
+      options(warn = oldw)
+      
+      # Extracting values from returned list
+      # Mean
+      fcastL2PMean[,i] <- round(fcastL2p[[1]],0)
+      fcastL2PMean[,i] <- round(replace(fcastL2PMean[,i], fcastL2PMean[,i] < 0, 0),0)
+      
+      # Lower 80% limit
+      fcastL2PLower80[,i] <- round(fcastL2p[[2]],0)
+      fcastL2PLower80[,i] <- round(replace(fcastL2PLower80[,i], fcastL2PLower80[,i] < 0, 0),0)
+      
+      # Upper 80% limit
+      fcastL2PUpper80[,i] <- round(fcastL2p[[3]],0)  
+      fcastL2PUpper80[,i] <- round(replace(fcastL2PUpper80[,i], fcastL2PUpper80[,i] < 0, 0),0)
+      
+      # Method
+      fcastL2PMethodRMSE$Method[i] <- fcastL2p[[4]]
+      
+      # RMSE
+      fcastL2PMethodRMSE$RMSE[i] <- round(fcastL2p[[5]],2)
+    }
+    
+    # L2 Saving forecasted values in a list #
+    fcastL2List <- list(fcastMean = fcastL2PMean, 
+                        fcastLower80 = fcastL2PLower80, 
+                        fcastUpper80 = fcastL2PUpper80, 
+                        fcastMethodRMSE = fcastL2PMethodRMSE)
+    
+    })
+  
+  #### Displaying summary statistics ####
+  output$summaryStat <- renderTable(
+    summaryStatisticsR()
+  )
+
+  #### Drop down for selecting SKU ####
+  output$selectSKU <- renderUI({
+
+    # Validation
+    validate(
+      need((input$datafileOrderHist != ""), "Please select a data set")
+    )
+
+    SKUInfo <- SKUInfoStartEndR()
+    SKU <- SKUInfo[,SKU]
+    selectInput("selectSKU", "Select SKU", c("Select",SKU))
+  })
+
+  #### Creating L1 filtered table ####
+  filterTableL1 <- reactive({
+    dataMonthlyL1_ts <- dataMonthlyL1_tsR()
+
+    if(input$selectSKU == "Select"){
+      head(dataMonthlyL1_ts)
+    }else{
+      dataMonthlyL1_ts <- dataMonthlyL1_ts[,input$selectSKU]
+    }
+
+  })
+  
+  
+  #### Displaying L1 filtered table ####
+  output$table <- renderTable({
+    filterTableL1()
+    })
+
+  #### Displaying demand types for parts ####
+  output$demandType <- renderTable({
+    SKUInfo <- SKUInfoDemTypeR()
+    SKUInfo[, .(NoOfParts =.N), by = c("tsClassL1Type")]
+  },
+  striped = TRUE, bordered = TRUE,  
+  hover = TRUE, spacing = 'xs')
+  
+  #### Displaying methods used in L1 forecasting ####
+  output$methodsUsed <- renderTable({
+    
+    fcastL1List <- fcastL1ListR()
+    fcastL1List$fcastMethodRMSE[,2][,.(NoOfParts =.N), by = c("Method")][order(-NoOfParts)]
+    
+  },
+  striped = TRUE, bordered = TRUE,  
+  hover = TRUE, spacing = 'xs')
+  
+  #### Displaying L1 forecast plot ####
+  output$plotL1 <- renderPlot({
+
+    dataMonthlyL1_ts <- dataMonthlyL1_tsR()
+    SKUInfo <- SKUInfoDemTypeR()
+    fcastL1List <- fcastL1ListR()
+
+    if(input$selectSKU == "Select"){
+      plot(0,0)
+    }else{
+      SKUVal <- input$selectSKU
+      SKUIndex <- which(colnames(dataMonthlyL1_ts) == SKUVal)
+      fcastHorizon <- 12
+
+      # Finding startMonth, startYear and demandType for part from partInfo table
+      currentSKUInfo <- SKUInfo[SKU == SKUVal, .(startMonth, startYear, tsClassL1Type)]
+
+      startMonth <- currentSKUInfo$startMonth
+      startYear <- currentSKUInfo$startYear
+      endMonth <- 8
+      endYear <- 2018
+
+      # Selecting the part of times series depeding on its start year and month
+      SKUTs <- window(dataMonthlyL1_ts[,SKUVal], c(startYear, startMonth), c(endYear, endMonth))
+
+      indexSKU <- which(colnames(dataMonthlyL1_ts) == SKUVal)
+      
+      # Extracting forecasted values of selected SKUs from fcast list
+      fcastp <- list(
+        mean = fcastL1List$fcastMean[,indexSKU],
+        lower80 = fcastL1List$fcastLower80[,indexSKU],
+        upper80 = fcastL1List$fcastUpper80[,indexSKU],
+        method = as.character(fcastL1List$fcastMethodRMSE[indexSKU,2]),
+        rmse = as.character(fcastL1List$fcastMethodRMSE[indexSKU,3])
+      )
+
+      meanFcast <- ts(if_else(fcastp$mean > 0, as.numeric(fcastp$mean), 0), frequency=12, start=c(endYear, endMonth+1))
+      upper80Fcast <- ts(if_else(fcastp$upper80 > 0, as.numeric(fcastp$upper80), 0), frequency=12, start=c(endYear, endMonth+1))
+      lower80Fcast <- ts(if_else(fcastp$lower80 > 0, as.numeric(fcastp$lower80), 0), frequency=12, start=c(endYear, endMonth+1))
+      methodFcast <- fcastp$method
+
+      time <- attr(SKUTs, "tsp")
+      time <- seq(time[1], attr(meanFcast, "tsp")[2], by=1/time[3])
+      lenx <- length(SKUTs)
+      lenmn <- length(meanFcast)
+
+      df <- data.frame(time=time,
+                       x=c(SKUTs, meanFcast),
+                       forecast=c(rep(NA, lenx), meanFcast),
+                       low1=c(rep(NA, lenx), lower80Fcast),
+                       upp1=c(rep(NA, lenx), upper80Fcast)
+      )
+
+      ggplot(df, aes(time, x)) +
+        geom_ribbon(aes(ymin=low1, ymax=upp1), fill="red",alpha = 0.2) +
+        geom_line() +
+        geom_line(data=df[!is.na(df$forecast), ], aes(time, forecast), color="red", na.rm=TRUE) +
+        scale_x_continuous("") +
+        scale_y_continuous("") +
+        ggtitle(paste("Forecasts from ", methodFcast)) +
+        theme(plot.title = element_text(size = 10, face = "bold")) +
+        theme_minimal()
+    }
+
+  })
+
+  #### Drop down for selecting L2 (Complexity) ####
+  output$selectComplexity <- renderUI({
+    
+    # Validation
+    validate(
+      need((input$datafileOrderHist != ""), "Please select a data set")
+    )
+    
+    cleanData <- cleanDataR()
+    complexity <- cleanData[,.N,by=c("Complexity")][,Complexity]
+    selectInput("selectComplexity", "Select Complexity", c("Select",complexity))
+  })
+  
+  #### Displaying L2 forecast plot ####
+  output$plotL2 <- renderPlot({
+    
+    cleanData <- cleanDataR()
+    dataMonthlyL2_ts <- dataMonthlyL2_tsR()
+    fcastL2List <- fcastL2ListR()
+    
+    if(input$selectComplexity == "Select"){
+      plot(0,0)
+    }else{
+      L2Val <- input$selectComplexity
+      indexL2 <- which(colnames(dataMonthlyL2_ts) == L2Val)
+      fcastHorizonL2 <- 12
+      
+      # Setting start and end time period
+      startMonth <- cleanData[Complexity == L2Val, min(month(Date))]
+      startYear <- cleanData[Complexity == L2Val, min(year(Date))]
+      endMonth <- 8
+      endYear <- 2018
+      
+      # Selecting the part of times series depeding on its start year and month
+      L2s <- window(dataMonthlyL2_ts[,L2Val], c(startYear, startMonth), c(endYear, endMonth))
+      
+      # Extracting forecasted values of selected SKUs from fcast list
+      fcastp <- list(
+        mean = fcastL2List$fcastMean[,indexL2],
+        lower80 = fcastL2List$fcastLower80[,indexL2],
+        upper80 = fcastL2List$fcastUpper80[,indexL2],
+        method = as.character(fcastL2List$fcastMethodRMSE[indexL2,2]),
+        rmse = as.character(fcastL2List$fcastMethodRMSE[indexL2,3])
+      )
+      
+      meanFcast <- ts(if_else(fcastp$mean > 0, as.numeric(fcastp$mean), 0), frequency=12, start=c(endYear, endMonth+1))
+      upper80Fcast <- ts(if_else(fcastp$upper80 > 0, as.numeric(fcastp$upper80), 0), frequency=12, start=c(endYear, endMonth+1))
+      lower80Fcast <- ts(if_else(fcastp$lower80 > 0, as.numeric(fcastp$lower80), 0), frequency=12, start=c(endYear, endMonth+1))
+      methodFcast <- fcastp$method
+      
+      time <- attr(L2s, "tsp")
+      time <- seq(time[1], attr(meanFcast, "tsp")[2], by=1/time[3])
+      lenx <- length(L2s)
+      lenmn <- length(meanFcast)
+      
+      df <- data.frame(time=time,
+                       x=c(L2s, meanFcast),
+                       forecast=c(rep(NA, lenx), meanFcast),
+                       low1=c(rep(NA, lenx), lower80Fcast),
+                       upp1=c(rep(NA, lenx), upper80Fcast)
+      )
+      
+      ggplot(df, aes(time, x)) +
+        geom_ribbon(aes(ymin=low1, ymax=upp1), fill="red",alpha = 0.2) +
+        geom_line() +
+        geom_line(data=df[!is.na(df$forecast), ], aes(time, forecast), color="red", na.rm=TRUE) +
+        scale_x_continuous("") +
+        scale_y_continuous("") +
+        ggtitle(paste("Forecasts from ", methodFcast)) +
+        theme(plot.title = element_text(size = 10, face = "bold")) +
+        theme_minimal()
+    }
+    
+  })
+  
+  output$multiprintFun <- renderText({
+    fcastL1List <- fcastL1ListR()
+    indexSKU <- 2
+    as.character(fcastL1List$fcastMethodRMSE[indexSKU,2])
+  })
+}
+
+shinyApp(ui, server)
